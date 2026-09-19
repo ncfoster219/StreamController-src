@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # One-command native StreamController launcher for Jiggly-Stream-Machine.
 # Usage: sc-native
-# Optional: sc-native --help
 set -euo pipefail
 
 SC_HOME="${SC_HOME:-$HOME/StreamController}"
@@ -25,30 +24,82 @@ The cpupower button is the 4th key from the left on the top row
 EOF
 }
 
+# SC setproctitle's itself to "StreamController" (16 chars). pgrep/pkill -x
+# only match the first 15 chars of comm, so -x never finds it.
+list_sc_pids() {
+  ps -eo pid=,args= | awk '
+    /[Ss]treamController/ && $0 !~ /sc-native|pgrep|awk|cursor-agent|bash -O/ {
+      print $1
+    }
+  '
+}
+
 stop_sc() {
   flatpak kill com.core447.StreamController 2>/dev/null || true
-  # Prefer graceful TERM on real SC processes only
-  for p in $(pgrep -f '/StreamController/(main\.py|\\.venv)' 2>/dev/null || true); do
-    kill "$p" 2>/dev/null || true
-  done
-  pkill -f 'python main.py --devel --data' 2>/dev/null || true
-  pkill -x StreamController 2>/dev/null || true
-  sleep 0.5
-  echo "Stopped (or nothing was running)."
+
+  local pids
+  pids="$(list_sc_pids || true)"
+  if [[ -z "${pids//[$'\n' ]/}" ]]; then
+    echo "No StreamController process found."
+    return 0
+  fi
+
+  echo "Stopping StreamController PIDs:" $pids
+  # shellcheck disable=SC2086
+  kill $pids 2>/dev/null || true
+  sleep 0.8
+
+  pids="$(list_sc_pids || true)"
+  if [[ -n "${pids//[$'\n' ]/}" ]]; then
+    echo "Still running — sending KILL:" $pids
+    # shellcheck disable=SC2086
+    kill -KILL $pids 2>/dev/null || true
+    sleep 0.3
+  fi
+
+  if list_sc_pids >/dev/null 2>&1 && [[ -n "$(list_sc_pids || true)" ]]; then
+    echo "WARNING: still running:" >&2
+    list_sc_pids >&2 || true
+    return 1
+  fi
+  echo "Stopped."
 }
 
 status_sc() {
-  if pgrep -af 'StreamController|main.py --devel' 2>/dev/null | grep -vE 'pgrep|sc-native|bash -O' ; then
+  local pids
+  pids="$(list_sc_pids || true)"
+  if [[ -n "${pids//[$'\n' ]/}" ]]; then
+    ps -eo pid,etime,cmd | awk 'NR==1 || /[Ss]treamController/' | grep -vE 'sc-native|awk|cursor-agent|bash -O' || true
     return 0
   fi
   echo "Not running."
   return 1
 }
 
+test_key() {
+  if ! list_sc_pids | grep -q .; then
+    echo "StreamController is not running. Start it with: sc-native" >&2
+    exit 1
+  fi
+  echo "Emulating cpupower button (top-row, 4th from left)…"
+  gdbus call --session --dest com.core447.StreamController \
+    --object-path /com/core447/StreamController \
+    --method com.core447.StreamController.EmulateInput \
+    "press" "AL49I2C04624" "Streaming Start Page" "3,0"
+  sleep 1
+  if wmctrl -l 2>/dev/null | grep -qi cpu; then
+    echo "OK — cpupower-gui window is visible."
+  else
+    echo "No cpupower-gui window seen yet. Check:"
+    echo "  grep '[first-press].*RunCommand' ~/.var/app/com.core447.StreamController/data/logs/logs.log | tail -20"
+  fi
+}
+
 case "${1:-}" in
   -h|--help) usage; exit 0 ;;
-  --stop) stop_sc; exit 0 ;;
+  --stop) stop_sc; exit $? ;;
   --status) status_sc; exit $? ;;
+  --test-key) test_key; exit $? ;;
   "") ;;
   *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
 esac
@@ -67,11 +118,11 @@ if command -v systemctl >/dev/null; then
 fi
 
 cd "$SC_HOME"
-# Prefer the first-press fix branch when present; otherwise stay on current.
 if git -C "$SC_HOME" rev-parse --verify cursor/runcommand-xauth-launch-e5fd >/dev/null 2>&1; then
   git -C "$SC_HOME" checkout -q cursor/runcommand-xauth-launch-e5fd 2>/dev/null || true
 elif git -C "$SC_HOME" rev-parse --verify cursor/first-press-glib-marshal-e5fd >/dev/null 2>&1; then
   git -C "$SC_HOME" checkout -q cursor/first-press-glib-marshal-e5fd 2>/dev/null || true
 fi
 
+echo "Starting StreamController (pid will be this process)…"
 exec "$VENV/bin/python" main.py --devel --data "$DATA"
