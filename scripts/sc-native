@@ -12,12 +12,16 @@ usage() {
   cat <<'EOF'
 sc-native — start native StreamController (patched data path)
 
-  sc-native           start (foreground; Ctrl+C or tray Quit to stop)
-  sc-native --stop    quit running StreamController / flatpak instance
-  sc-native --status  show if something is running
-  sc-native --help    this help
+  sc-native              start (foreground; Ctrl+C or tray Quit to stop)
+  sc-native --stop       quit running StreamController / flatpak instance
+  sc-native --status     show if something is running
+  sc-native --test-key   with SC already running: emulate the cpupower button
+  sc-native --help       this help
 
 You do NOT need git checkout / source activate every time.
+
+The cpupower button is the 4th key from the left on the top row
+(StreamController index 3, page coords 3x0) — not keyboard "3".
 EOF
 }
 
