@@ -344,6 +344,11 @@ class KeyButton(Gtk.Frame):
         if not settings.get("key-grid", {}).get("emulate-at-double-click", True):
             return
         
+        import threading
+        log.info(
+            f"[first-press] GUI simulate_press ident={self.identifier} "
+            f"thread={threading.current_thread().name}"
+        )
         self.key_grid.deck_controller.event_callback(self.identifier, True)
         # Release key after 100ms
         GLib.timeout_add(100, self.key_grid.deck_controller.event_callback, self.identifier, False)

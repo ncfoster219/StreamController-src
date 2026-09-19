@@ -137,13 +137,29 @@ class ActionCore(rpyc.Service):
         # dropped if it's still not ready after PENDING_EVENT_TIMEOUT seconds.
         retry = lambda: self._raw_event_callback(event, data)
         if self.queue_action_event(retry):
+            log.info(
+                f"[first-press] queued action event action={self.action_id} "
+                f"event={event} (action backend not ready)"
+            )
             return
         if self.plugin_base is not None and self.plugin_base.queue_action_event(retry):
+            log.info(
+                f"[first-press] queued action event action={self.action_id} "
+                f"event={event} (plugin backend not ready)"
+            )
             return
 
         event_assigner = self.event_manager.get_event_assigner_for_event(event)
         if event_assigner:
+            log.info(
+                f"[first-press] invoke action={self.action_id} event={event} "
+                f"assigner={event_assigner.id}"
+            )
             event_assigner.call(data)
+        else:
+            log.info(
+                f"[first-press] no assigner action={self.action_id} event={event}"
+            )
 
     def event_callback(self, event: InputEvent, data: dict = None):
         pass

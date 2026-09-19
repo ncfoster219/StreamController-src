@@ -735,6 +735,11 @@ class DeckController:
         # Open the deck - why store it as self.deck? So that self.get_alive() returns True in get_deck_settings
         self.deck = deck
         try:
+            # Beta-resume reader only updates last_key_states when key_callback is
+            # not None. open() starts that reader immediately, but the real callback
+            # is installed much later — install a no-op first so early HID reports
+            # still advance last_key_states and the first real press is not lost.
+            self.deck.set_key_callback(lambda *_args, **_kwargs: None)
             self.deck.open(self.deck_manager.beta_resume_mode)
             rotation = self.get_deck_settings().get("rotation", 0)
         except Exception as e:
@@ -931,14 +936,53 @@ class DeckController:
         log.debug(f"Updating all inputs took {time.time() - start} seconds")
 
     def event_callback(self, ident: InputIdentifier, *args, **kwargs):
+        """Dispatch an input event.
+
+        Hardware HID callbacks arrive on the StreamDeck reader thread. GUI
+        simulate_press runs on the GLib main loop. ControllerKey.event_callback
+        touches press-state rendering and (when the window is mapped) GTK
+        widgets — so hardware must be marshaled onto the main loop to match the
+        working GUI path. See first-press / #609.
+        """
         if not self.allow_interaction:
+            log.info(
+                f"[first-press] drop event ident={ident} args={args} "
+                f"(allow_interaction=False) thread={threading.current_thread().name}"
+            )
             return
+
+        ctx = GLib.main_context_default()
+        if ctx.is_owner():
+            self._dispatch_input_event(ident, *args, **kwargs)
+            return
+
+        def _on_main() -> bool:
+            self._dispatch_input_event(ident, *args, **kwargs)
+            return GLib.SOURCE_REMOVE
+
+        GLib.idle_add(_on_main)
+
+    def _dispatch_input_event(self, ident: InputIdentifier, *args, **kwargs):
         i = self.get_input(ident)
         if not i:
+            log.info(
+                f"[first-press] no ControllerInput for ident={ident} "
+                f"args={args} thread={threading.current_thread().name}"
+            )
             return
+        log.info(
+            f"[first-press] dispatch ident={ident} args={args} "
+            f"screensaver={self.screen_saver.showing} "
+            f"page={getattr(self.active_page, 'json_path', None)} "
+            f"thread={threading.current_thread().name}"
+        )
         i.event_callback(*args, **kwargs)
 
     def key_event_callback(self, deck, key, *args, **kwargs):
+        log.info(
+            f"[first-press] hardware key_event key={key} args={args} "
+            f"thread={threading.current_thread().name}"
+        )
         if key >= self.deck.key_count():
             # Touch keys are indexed after the regular keys and are not part of the key grid
             ident = Input.TouchKey(str(key - self.deck.key_count()))
@@ -3244,6 +3288,10 @@ class ControllerKey(ControllerInput):
             # Only on key down this allows plugins to control screen saver without directly deactivating it
             self.deck_controller.screen_saver.on_key_change()
         if screensaver_was_showing:
+            log.info(
+                f"[first-press] ControllerKey {self.identifier} press={press_state} "
+                "eaten by screensaver wake (no actions)"
+            )
             return
         
         self.deck_controller.mark_page_ready_to_clear(False)

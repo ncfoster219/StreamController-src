@@ -149,11 +149,21 @@ class App(Adw.Application):
         if not gl.IS_MAC:
             start_dbus_service()
 
+        # Prime WindowGrabber against the already-focused window. Without this,
+        # auto-change / page readiness can stay stale until the first focus
+        # change (GUI reopen, launching an app from a RunCommand key, etc.) —
+        # matching the #609 "wake by local action" workaround.
+        if gl.window_grabber is not None:
+            GLib.idle_add(gl.window_grabber.recheck_active_window)
+
         log.success("Finished loading app")
 
     def on_reopen(self, *args, **kwargs):
         self.ensure_main_window(present=True)
         log.info("awake")
+
+        if gl.window_grabber is not None:
+            GLib.idle_add(gl.window_grabber.recheck_active_window)
 
         self.show_donate(ignore_background_launch=True)
 
