@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# One-command native StreamController launcher for Jiggly-Stream-Machine.
+# Usage: sc-native
+# Optional: sc-native --help
+set -euo pipefail
+
+SC_HOME="${SC_HOME:-$HOME/StreamController}"
+DATA="${SC_DATA:-$HOME/.var/app/com.core447.StreamController/data}"
+VENV="$SC_HOME/.venv-native"
+
+usage() {
+  cat <<'EOF'
+sc-native — start native StreamController (patched data path)
+
+  sc-native           start (foreground; Ctrl+C or tray Quit to stop)
+  sc-native --stop    quit running StreamController / flatpak instance
+  sc-native --status  show if something is running
+  sc-native --help    this help
+
+You do NOT need git checkout / source activate every time.
+EOF
+}
+
+stop_sc() {
+  flatpak kill com.core447.StreamController 2>/dev/null || true
+  # Prefer graceful TERM on real SC processes only
+  for p in $(pgrep -f '/StreamController/(main\.py|\\.venv)' 2>/dev/null || true); do
+    kill "$p" 2>/dev/null || true
+  done
+  pkill -f 'python main.py --devel --data' 2>/dev/null || true
+  pkill -x StreamController 2>/dev/null || true
+  sleep 0.5
+  echo "Stopped (or nothing was running)."
+}
+
+status_sc() {
+  if pgrep -af 'StreamController|main.py --devel' 2>/dev/null | grep -vE 'pgrep|sc-native|bash -O' ; then
+    return 0
+  fi
+  echo "Not running."
+  return 1
+}
+
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+  --stop) stop_sc; exit 0 ;;
+  --status) status_sc; exit $? ;;
+  "") ;;
+  *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
+esac
+
+if [[ ! -x "$VENV/bin/python" ]]; then
+  echo "Missing venv at $VENV — create/activate once before using sc-native." >&2
+  exit 1
+fi
+
+# Pull DISPLAY / XAUTHORITY / DBUS from the graphical session
+if command -v systemctl >/dev/null; then
+  set -a
+  # shellcheck disable=SC1091
+  eval "$(systemctl --user show-environment 2>/dev/null | grep -E '^(DISPLAY|XAUTHORITY|WAYLAND_DISPLAY|DBUS_SESSION_BUS_ADDRESS|XDG_RUNTIME_DIR|XDG_CURRENT_DESKTOP)=' || true)"
+  set +a
+fi
+
+cd "$SC_HOME"
+# Prefer the first-press fix branch when present; otherwise stay on current.
+if git -C "$SC_HOME" rev-parse --verify cursor/runcommand-xauth-launch-e5fd >/dev/null 2>&1; then
+  git -C "$SC_HOME" checkout -q cursor/runcommand-xauth-launch-e5fd 2>/dev/null || true
+elif git -C "$SC_HOME" rev-parse --verify cursor/first-press-glib-marshal-e5fd >/dev/null 2>&1; then
+  git -C "$SC_HOME" checkout -q cursor/first-press-glib-marshal-e5fd 2>/dev/null || true
+fi
+
+exec "$VENV/bin/python" main.py --devel --data "$DATA"
