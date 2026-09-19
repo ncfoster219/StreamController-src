@@ -1,10 +1,14 @@
 import functools
+import glob
 import os
 import pwd
 import shlex
+import shutil
 import subprocess
+import tempfile
 import threading
 import time
+from configparser import ConfigParser
 
 from loguru import logger as log
 
@@ -82,15 +86,17 @@ class RunCommand(ActionBase):
             self.set_output_label("")
 
         cmd = settings.get("command", None)
+        env_preview = resolve_gui_env()
         log.info(
             f"[first-press] RunCommand.execute cmd={cmd!r} "
             f"detached={settings.get('detached', True)} "
             f"display_output={settings.get('display_output', False)} "
             f"thread={threading.current_thread().name} "
-            f"DISPLAY={os.environ.get('DISPLAY')!r} "
-            f"WAYLAND_DISPLAY={os.environ.get('WAYLAND_DISPLAY')!r} "
-            f"DBUS_SESSION_BUS_ADDRESS={os.environ.get('DBUS_SESSION_BUS_ADDRESS')!r} "
-            f"XDG_RUNTIME_DIR={os.environ.get('XDG_RUNTIME_DIR')!r} "
+            f"DISPLAY={env_preview.get('DISPLAY')!r} "
+            f"WAYLAND_DISPLAY={env_preview.get('WAYLAND_DISPLAY')!r} "
+            f"XAUTHORITY={env_preview.get('XAUTHORITY')!r} "
+            f"DBUS_SESSION_BUS_ADDRESS={env_preview.get('DBUS_SESSION_BUS_ADDRESS')!r} "
+            f"XDG_RUNTIME_DIR={env_preview.get('XDG_RUNTIME_DIR')!r} "
             f"cwd_will_be={os.path.expanduser('~')!r}"
         )
         result = self.run_command(cmd)
@@ -235,62 +241,91 @@ class RunCommand(ActionBase):
             log.info("[first-press] RunCommand skipped: command is None")
             return
 
+        original = command
         if self.get_settings().get("interactive_shell", False):
             # Run in an interactive shell so that aliases and functions from the user's rc files are available
             command = f"{shlex.quote(get_user_shell())} -ic {shlex.quote(command)}"
+
+        # Prefer desktop/DBus activation for single-token GUI apps (e.g. cpupower-gui).
+        # Raw binary start of a Gtk.Application can register on the bus without raising
+        # a window; a later press/GUI click then "works" via present(). Desktop Exec for
+        # cpupower-gui is `gapplication launch org.rnd2.cpupower_gui`.
+        launch_method = "raw"
+        if not self.get_settings().get("interactive_shell", False):
+            rewritten, launch_method = rewrite_command_for_desktop_launch(command)
+            if rewritten != command:
+                log.info(
+                    f"[first-press] RunCommand rewrite {original!r} -> {rewritten!r} "
+                    f"via {launch_method}"
+                )
+                command = rewritten
 
         if is_in_flatpak():
             command = "flatpak-spawn --host " + command
 
         cwd = os.path.expanduser("~")
         detached = self.get_settings().get("detached", True)
-        env = os.environ.copy()
+        env = resolve_gui_env()
+        if not env.get("XAUTHORITY") and env.get("DISPLAY"):
+            log.warning(
+                "[first-press] RunCommand: XAUTHORITY still unset after resolve; "
+                "X11 GUI children may start without a visible window"
+            )
 
-        # Do NOT wrap Popen in multiprocessing.Process. SC is multi-threaded
-        # (GTK + HID reader + media player); fork-based Process.start() races on
-        # cold start and can silently drop/hang the first launch — invoke still
-        # logs success while the child never appears. start_new_session detaches.
+        # Do NOT wrap Popen in multiprocessing.Process (fork under GTK/HID threads).
+        activator = launch_method.split(":", 1)[0] in (
+            "gapplication", "gtk-launch", "gio", "systemd-run",
+        )
         try:
             if detached:
-                proc = subprocess.Popen(
-                    command,
-                    shell=True,
-                    start_new_session=True,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.PIPE,
-                    cwd=cwd,
-                    env=env,
-                    text=True,
+                err_file = tempfile.NamedTemporaryFile(
+                    prefix="sc-runcommand-", suffix=".err", delete=False, mode="w+b"
                 )
-                # Drain stderr so a full pipe cannot block the child; log any output
-                def _drain_stderr(p=proc, cmd=command):
-                    try:
-                        err = p.stderr.read() if p.stderr else ""
-                        if err:
-                            log.warning(
-                                f"[first-press] RunCommand stderr pid={p.pid} "
-                                f"cmd={cmd!r} stderr={err.strip()!r}"
-                            )
-                    except Exception as drain_err:
-                        log.warning(f"[first-press] RunCommand stderr drain failed: {drain_err}")
-
-                threading.Thread(
-                    target=_drain_stderr, name="RunCommandStderr", daemon=True
-                ).start()
-
-                time.sleep(0.05)
-                rc = proc.poll()
-                if rc is None:
-                    log.info(
-                        f"[first-press] RunCommand started pid={proc.pid} "
-                        f"detached=True cmd={command!r}"
+                err_path = err_file.name
+                err_file.close()
+                with open(err_path, "wb") as err_f:
+                    proc = subprocess.Popen(
+                        command,
+                        shell=True,
+                        start_new_session=True,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=err_f,
+                        cwd=cwd,
+                        env=env,
                     )
-                else:
-                    log.error(
-                        f"[first-press] RunCommand exited immediately "
-                        f"pid={proc.pid} rc={rc} detached=True cmd={command!r}"
-                    )
+                log.info(
+                    f"[first-press] RunCommand started pid={proc.pid} "
+                    f"detached=True method={launch_method} cmd={command!r} "
+                    f"XAUTHORITY={env.get('XAUTHORITY')!r} stderr_file={err_path}"
+                )
+                exited = False
+                for label, delay in (("50ms", 0.05), ("200ms", 0.15)):
+                    time.sleep(delay)
+                    rc = proc.poll()
+                    err_tail = _read_file_tail(err_path, 2000)
+                    if rc is None:
+                        log.info(
+                            f"[first-press] RunCommand still running "
+                            f"pid={proc.pid} at={label} method={launch_method}"
+                        )
+                    else:
+                        # Activators often exit 0 quickly after DBus handoff — success.
+                        level = log.info if (activator and rc == 0) else log.error
+                        level(
+                            f"[first-press] RunCommand exited pid={proc.pid} "
+                            f"rc={rc} at={label} method={launch_method} "
+                            f"cmd={command!r} stderr={err_tail!r}"
+                        )
+                        exited = True
+                        break
+                if not exited:
+                    err_tail = _read_file_tail(err_path, 2000)
+                    if err_tail:
+                        log.warning(
+                            f"[first-press] RunCommand stderr pid={proc.pid} "
+                            f"cmd={command!r} stderr={err_tail!r}"
+                        )
                 return ""
 
             result = subprocess.Popen(
@@ -305,7 +340,7 @@ class RunCommand(ActionBase):
             )
             log.info(
                 f"[first-press] RunCommand started pid={result.pid} "
-                f"detached=False cmd={command!r}"
+                f"detached=False method={launch_method} cmd={command!r}"
             )
             out, err = result.communicate()
             out = (out or "").rstrip()
@@ -325,6 +360,174 @@ class RunCommand(ActionBase):
                 f"[first-press] RunCommand failed cmd={command!r} error={e}"
             )
             return ""
+
+
+def _read_file_tail(path: str, max_bytes: int) -> str:
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        if not data:
+            return ""
+        return data[-max_bytes:].decode("utf-8", errors="replace").strip()
+    except Exception:
+        return ""
+
+
+def _systemd_user_environment() -> dict:
+    """Best-effort read of `systemctl --user show-environment` (session DISPLAY/XAUTH)."""
+    out = {}
+    try:
+        cmd = ["systemctl", "--user", "show-environment"]
+        if is_in_flatpak():
+            cmd = ["flatpak-spawn", "--host", "--"] + cmd
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=2, check=False
+        )
+        if proc.returncode != 0:
+            return out
+        for line in (proc.stdout or "").splitlines():
+            if "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            out[key] = val
+    except Exception:
+        pass
+    return out
+
+
+def _find_runtime_xauthority() -> str | None:
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    pattern = os.path.join(runtime, "xauth_*")
+    candidates = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
+    for path in candidates:
+        if os.path.isfile(path) and os.access(path, os.R_OK):
+            return path
+    home = os.path.expanduser("~/.Xauthority")
+    if os.path.isfile(home) and os.access(home, os.R_OK):
+        return home
+    return None
+
+
+def resolve_gui_env() -> dict:
+    """
+    Copy process env and fill gaps GUI apps need on X11 cold start.
+
+    On this host ~/.Xauthority does not exist; the session cookie lives at
+    /run/user/$UID/xauth_*. Missing XAUTHORITY lets cpupower-gui stay alive
+    (pid returned) without mapping a window — matching cold deck presses.
+    """
+    env = os.environ.copy()
+    # Flatpak host spawn should talk to the real session bus when possible.
+    if is_in_flatpak() and env.get("DBUS_SESSION_BUS_ADDRESS", "").startswith(
+        "unix:path=/run/flatpak/bus"
+    ):
+        host_bus = f"unix:path=/run/user/{os.getuid()}/bus"
+        if os.path.exists(f"/run/user/{os.getuid()}/bus"):
+            env["DBUS_SESSION_BUS_ADDRESS"] = host_bus
+
+    need_keys = ("DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR")
+    if any(not env.get(k) for k in need_keys):
+        sysd = _systemd_user_environment()
+        for k in need_keys:
+            if not env.get(k) and sysd.get(k):
+                env[k] = sysd[k]
+                log.info(f"[first-press] RunCommand filled {k} from systemd --user env")
+
+    if not env.get("XAUTHORITY"):
+        xauth = _find_runtime_xauthority()
+        if xauth:
+            env["XAUTHORITY"] = xauth
+            log.info(f"[first-press] RunCommand filled XAUTHORITY from runtime path {xauth!r}")
+
+    if not env.get("XDG_RUNTIME_DIR"):
+        runtime = f"/run/user/{os.getuid()}"
+        if os.path.isdir(runtime):
+            env["XDG_RUNTIME_DIR"] = runtime
+
+    return env
+
+
+def _xdg_application_dirs() -> list:
+    dirs = []
+    data_home = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    dirs.append(os.path.join(data_home, "applications"))
+    data_dirs = os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share"
+    for d in data_dirs.split(":"):
+        if d:
+            dirs.append(os.path.join(d, "applications"))
+    return dirs
+
+
+def find_desktop_entry_for_command(command: str):
+    """
+    Return (desktop_path, application_id, dbus_activatable) for a simple command.
+    """
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return None, None, False
+    if len(parts) != 1:
+        return None, None, False
+    token = parts[0]
+    base = os.path.basename(token)
+
+    for app_dir in _xdg_application_dirs():
+        if not os.path.isdir(app_dir):
+            continue
+        for path in glob.glob(os.path.join(app_dir, "*.desktop")):
+            try:
+                cp = ConfigParser(interpolation=None)
+                cp.read(path, encoding="utf-8")
+                if "Desktop Entry" not in cp:
+                    continue
+                section = cp["Desktop Entry"]
+                if section.get("NoDisplay", "false").lower() == "true":
+                    continue
+                if section.get("Hidden", "false").lower() == "true":
+                    continue
+                exec_line = section.get("Exec", "")
+                try:
+                    exec_bin = shlex.split(exec_line.replace("%%", "%"))[0] if exec_line else ""
+                except ValueError:
+                    exec_bin = ""
+                exec_base = os.path.basename(exec_bin) if exec_bin else ""
+                name = os.path.splitext(os.path.basename(path))[0]
+                icon = section.get("Icon", "")
+                matches = (
+                    exec_base == base
+                    or base == name
+                    or base == icon
+                    or (f"/{base}" in exec_line)
+                    or exec_line.strip().endswith(base)
+                    or base in name
+                )
+                if not matches and section.get("Name", "").lower() == base.lower():
+                    matches = True
+                if not matches:
+                    continue
+                dbus_act = section.get("DBusActivatable", "false").lower() == "true"
+                return path, name, dbus_act
+            except Exception:
+                continue
+    return None, None, False
+
+
+def rewrite_command_for_desktop_launch(command: str):
+    """
+    Rewrite a simple GUI command to a session-aware launcher when possible.
+    Returns (command, method_tag).
+    """
+    path, app_id, dbus_act = find_desktop_entry_for_command(command)
+    if not path:
+        return command, "raw"
+    if dbus_act and app_id and shutil.which("gapplication"):
+        return f"gapplication launch {shlex.quote(app_id)}", f"gapplication:{app_id}"
+    desk_id = os.path.splitext(os.path.basename(path))[0]
+    if shutil.which("gtk-launch"):
+        return f"gtk-launch {shlex.quote(desk_id)}", f"gtk-launch:{desk_id}"
+    if shutil.which("gio"):
+        return f"gio launch {shlex.quote(path)}", f"gio:{path}"
+    return command, "raw"
 
 
 def is_in_flatpak() -> bool:
