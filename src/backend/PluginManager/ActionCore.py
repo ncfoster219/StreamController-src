@@ -616,8 +616,27 @@ class ActionCore(rpyc.Service):
 
         if self.backend_connection is None:
             log.error(f"{self.action_id} - Could not connect to action backend within {timeout}s")
+            if self._backend_process_alive():
+                log.warning(
+                    f"{self.action_id} - Backend process still running; "
+                    "continuing to queue action events until register_backend or process exit"
+                )
+                threading.Thread(
+                    target=self._wait_for_backend_process_end,
+                    name="wait_for_backend_process_end",
+                    daemon=True,
+                ).start()
+                return
             self.backend_launch_pending = False
-            self._flush_pending_action_events()
+            self._drop_pending_action_events("backend connect timed out")
+
+    def _wait_for_backend_process_end(self) -> None:
+        while self.backend_connection is None:
+            if not self._backend_process_alive():
+                self.backend_launch_pending = False
+                self._drop_pending_action_events("backend process exited without registering")
+                return
+            time.sleep(0.2)
 
     def register_backend(self, port: int):
         """
@@ -629,6 +648,16 @@ class ActionCore(rpyc.Service):
         self.backend_launch_pending = False
         self.on_backend_ready()
         self._flush_pending_action_events()
+
+    def _backend_process_alive(self) -> bool:
+        return self.backend_process is not None and self.backend_process.poll() is None
+
+    def _should_queue_action_events(self) -> bool:
+        if self.backend_launch_pending:
+            return True
+        if self.backend is None and self._backend_process_alive():
+            return True
+        return False
 
     def queue_action_event(self, retry: callable) -> bool:
         """
@@ -645,14 +674,23 @@ class ActionCore(rpyc.Service):
             bool: True if the event was queued (caller should not dispatch it now), False if there is
             nothing pending and the caller should dispatch it immediately.
         """
-        if not self.backend_launch_pending:
+        if not self._should_queue_action_events():
             return False
 
         with self._pending_action_events_lock:
-            if not self.backend_launch_pending:
+            if not self._should_queue_action_events():
                 return False
             self._pending_action_events.append((time.monotonic(), retry))
         return True
+
+    def _drop_pending_action_events(self, reason: str) -> None:
+        with self._pending_action_events_lock:
+            pending = self._pending_action_events
+            self._pending_action_events = []
+        if pending:
+            log.warning(
+                f"{self.action_id} - Dropping {len(pending)} queued action event(s) ({reason})"
+            )
 
     def _flush_pending_action_events(self) -> None:
         with self._pending_action_events_lock:
