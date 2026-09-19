@@ -154,6 +154,10 @@ class App(Adw.Application):
         # change (GUI reopen, launching an app from a RunCommand key, etc.) —
         # matching the #609 "wake by local action" workaround.
         if gl.window_grabber is not None:
+            try:
+                gl.window_grabber.recheck_active_window()
+            except Exception as e:
+                log.warning(f"[first-press] WindowGrabber sync recheck failed: {e}")
             GLib.idle_add(gl.window_grabber.recheck_active_window)
 
         log.success("Finished loading app")

@@ -773,6 +773,11 @@ class DeckController:
 
         self.screen_saver = ScreenSaver(deck_controller=self)
         self.allow_interaction = True
+        # False until the first page's actions are initialized. Early hardware
+        # presses are queued and flushed so cold-start races do not drop them.
+        self._press_ready = False
+        self._pending_input_events: list[tuple] = []
+        self._pending_input_lock = threading.Lock()
         self.has_animated_keys = False
 
         self.key_spacing = (36, 36)
@@ -958,11 +963,21 @@ class DeckController:
 
         def _on_main() -> bool:
             self._dispatch_input_event(ident, *args, **kwargs)
-            return GLib.SOURCE_REMOVE
+            return False  # SOURCE_REMOVE — run once
 
         GLib.idle_add(_on_main)
 
     def _dispatch_input_event(self, ident: InputIdentifier, *args, **kwargs):
+        if not self._press_ready:
+            with self._pending_input_lock:
+                if not self._press_ready:
+                    self._pending_input_events.append((ident, args, kwargs))
+                    log.info(
+                        f"[first-press] defer event until page ready "
+                        f"ident={ident} args={args} queued={len(self._pending_input_events)}"
+                    )
+                    return
+
         i = self.get_input(ident)
         if not i:
             log.info(
@@ -977,6 +992,36 @@ class DeckController:
             f"thread={threading.current_thread().name}"
         )
         i.event_callback(*args, **kwargs)
+
+    def _set_press_ready(self, ready: bool) -> None:
+        pending: list[tuple] = []
+        with self._pending_input_lock:
+            self._press_ready = ready
+            if ready and self._pending_input_events:
+                pending = list(self._pending_input_events)
+                self._pending_input_events.clear()
+
+        if not ready:
+            log.info("[first-press] press_ready=False (page loading)")
+            return
+
+        log.info(
+            f"[first-press] press_ready=True "
+            f"flushing={len(pending)} page={getattr(self.active_page, 'json_path', None)}"
+        )
+        for ident, args, kwargs in pending:
+            # Already on/off main — schedule flush on main to keep order with HID marshal
+            def _flush(i=ident, a=args, k=kwargs) -> bool:
+                self._dispatch_input_event(i, *a, **k)
+                return False
+            GLib.idle_add(_flush)
+
+        # Prime auto-change against the already-focused window once inputs exist
+        if gl.window_grabber is not None:
+            try:
+                gl.window_grabber.recheck_active_window()
+            except Exception as e:
+                log.warning(f"[first-press] WindowGrabber recheck failed: {e}")
 
     def key_event_callback(self, deck, key, *args, **kwargs):
         log.info(
@@ -1102,10 +1147,12 @@ class DeckController:
             # Use the first page
             pages = gl.page_manager.get_pages()
             if len(pages) == 0:
+                self._set_press_ready(True)
                 return
             default_page_path = gl.page_manager.get_pages()[0]
 
         if default_page_path is None:
+            self._set_press_ready(True)
             return
         
         page = gl.page_manager.get_page(default_page_path, self)
@@ -1402,7 +1449,11 @@ class DeckController:
         if page is None:
             # Clear deck
             self.clear()
+            self._set_press_ready(True)
             return
+
+        # Hold hardware presses until actions on this page are initialized
+        self._set_press_ready(False)
 
         log.info(f"Loading page {page.get_name()} on deck {self.safe_serial_number()}")
 
@@ -1440,6 +1491,9 @@ class DeckController:
         t_initialize_actions = time.time()
         self.active_page.initialize_actions()
         initialize_actions_ms = (time.time() - t_initialize_actions) * 1000
+
+        # Accept (and flush any deferred) hardware presses now that actions exist
+        self._set_press_ready(True)
 
         # Load page onto deck
         self.media_player.add_task(self.update_all_inputs, task_label=f"update_all_inputs:{page.get_name()}")
