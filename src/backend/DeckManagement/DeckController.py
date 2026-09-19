@@ -1009,6 +1009,18 @@ class DeckController:
             f"[first-press] press_ready=True "
             f"flushing={len(pending)} page={getattr(self.active_page, 'json_path', None)}"
         )
+        # Drop sticky HID edge state accumulated during open()/clear()/image
+        # load. A stuck True in last_key_states makes the first physical press
+        # a silent no-op (library only fires on old!=new) — matches cold
+        # sc-native sessions with zero hardware key_event lines.
+        self._resync_hid_key_states(reason="press_ready")
+        # Image/media writes after press_ready can corrupt HID edges; re-sync a few times.
+        for delay_ms, label in ((750, "delayed_750ms"), (1500, "delayed_1500ms"), (3000, "delayed_3000ms")):
+            def _delayed(resync_label=label) -> bool:
+                self._resync_hid_key_states(reason=resync_label)
+                return False
+            GLib.timeout_add(delay_ms, _delayed)
+
         for ident, args, kwargs in pending:
             # Already on/off main — schedule flush on main to keep order with HID marshal
             def _flush(i=ident, a=args, k=kwargs) -> bool:
@@ -1023,9 +1035,50 @@ class DeckController:
             except Exception as e:
                 log.warning(f"[first-press] WindowGrabber recheck failed: {e}")
 
+    def _raw_streamdeck(self):
+        """Underlying StreamDeck device (RotatedDeck wraps it as .deck)."""
+        d = self.deck
+        return getattr(d, "deck", d)
+
+    def _resync_hid_key_states(self, reason: str = "") -> None:
+        """
+        Reset cached HID key edges so the next physical press always generates
+        a callback. Safe when no keys are held; if a key is physically held we
+        may miss that hold until release+repress (acceptable for cold start).
+        """
+        try:
+            raw = self._raw_streamdeck()
+            states = getattr(raw, "last_key_states", None)
+            if not states:
+                return
+            sticky = [i for i, v in enumerate(states) if v]
+            if sticky:
+                log.warning(
+                    f"[first-press] clearing sticky last_key_states indices={sticky} "
+                    f"reason={reason}"
+                )
+            else:
+                log.info(
+                    f"[first-press] hid key state sync (no sticky bits) "
+                    f"n={len(states)} reason={reason}"
+                )
+            raw.last_key_states = [False] * len(states)
+            dials = getattr(raw, "last_dial_states", None)
+            if dials:
+                raw.last_dial_states = [False] * len(dials)
+        except Exception as e:
+            log.warning(f"[first-press] hid key state sync failed: {e}")
+
     def key_event_callback(self, deck, key, *args, **kwargs):
+        try:
+            raw = self._raw_streamdeck()
+            cached = getattr(raw, "last_key_states", None)
+            cached_bit = cached[key] if cached is not None and key < len(cached) else None
+        except Exception:
+            cached_bit = None
         log.info(
             f"[first-press] hardware key_event key={key} args={args} "
+            f"cached_after={cached_bit} "
             f"thread={threading.current_thread().name}"
         )
         if key >= self.deck.key_count():
@@ -1363,6 +1416,8 @@ class DeckController:
             for future in futures:
                 future.result()
         log.info(f"Loading all inputs took {time.time() - start} seconds")
+        # Image writes can leave sticky HID edges after press_ready sync.
+        self._resync_hid_key_states(reason="load_all_inputs")
 
     def load_input_from_identifier(self, identifier: str, page: Page, update: bool = True):
         controller_input = self.get_input(identifier)

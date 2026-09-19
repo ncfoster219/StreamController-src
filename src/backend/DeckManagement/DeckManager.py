@@ -51,6 +51,15 @@ ELGATO_VENDOR_ID = "0fd9"
 
 class DeckManager:
     def __init__(self):
+        # Patch StreamDeck resume HID reader before any deck.open()
+        try:
+            from src.backend.DeckManagement.streamdeck_hid_patch import (
+                apply_streamdeck_resume_reader_patch,
+            )
+            apply_streamdeck_resume_reader_patch()
+        except Exception as e:
+            log.warning(f"[first-press] StreamDeck HID patch failed to apply: {e}")
+
         #TODO: Maybe outsource some objects
         self.deck_controller: list[DeckController] = []
         self.fake_deck_controller = []
