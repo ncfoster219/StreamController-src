@@ -1,13 +1,12 @@
 """
-Focused StreamDeck patch for cold first-press: match `_read()` state policy.
+Focused StreamDeck patches for cold first-press.
 
-Upstream `_read_with_resume_from_suspend` only updated last_key_states when a
-key_callback was set. open() starts that reader before the real callback is
-installed, so early reports could leave sticky True bits and the first physical
-press became a silent no-op (old==new, no callback).
-
-This is the library correctness fix only — no noise filter, heartbeats, or
-LibUSB mutex changes.
+1. Resume reader: always advance last_key_states (match `_read()`), even when
+   key_callback is still None during open().
+2. LibUSBHIDAPI: do not hold Library.mutex around hid_read/hid_write — Device
+   mutex already serializes a handle. Global lock during image OUT floods can
+   starve the IN reader; multi-prime without this made cold press *worse*
+   (~0% vs ~50% with a single prime).
 """
 
 from __future__ import annotations
@@ -17,12 +16,53 @@ import time
 from loguru import logger as log
 
 _PATCHED = False
+_LIBUSB_PATCHED = False
+
+
+def apply_libusb_hidapi_io_mutex_patch() -> bool:
+    """Stop holding the global Library.mutex during per-handle read/write."""
+    global _LIBUSB_PATCHED
+    if _LIBUSB_PATCHED:
+        return True
+    try:
+        from StreamDeck.Transport.LibUSBHIDAPI import LibUSBHIDAPI
+        from StreamDeck.Transport.Transport import TransportError
+        import ctypes
+    except Exception as e:
+        log.warning(f"[first-press] could not import LibUSBHIDAPI for mutex patch: {e}")
+        return False
+
+    def write(self, handle, data):
+        if not handle:
+            raise TransportError("No HID device.")
+        result = self.hidapi.hid_write(handle, bytes(data), len(data))
+        if result < 0:
+            raise TransportError(f"Failed to write out report ({result})")
+        return result
+
+    def read(self, handle, length):
+        if not handle:
+            raise TransportError("No HID device.")
+        data = ctypes.create_string_buffer(length)
+        result = self.hidapi.hid_read(handle, data, len(data))
+        if result < 0:
+            raise TransportError(f"Failed to read in report ({result})")
+        if result == 0:
+            return None
+        return data.raw[:length]
+
+    LibUSBHIDAPI.Library.write = write
+    LibUSBHIDAPI.Library.read = read
+    _LIBUSB_PATCHED = True
+    log.info("[first-press] applied LibUSBHIDAPI read/write mutex patch")
+    return True
 
 
 def apply_streamdeck_resume_reader_patch() -> bool:
     global _PATCHED
     if _PATCHED:
         return True
+    apply_libusb_hidapi_io_mutex_patch()
     try:
         from StreamDeck.Devices.StreamDeck import (
             ControlType,
