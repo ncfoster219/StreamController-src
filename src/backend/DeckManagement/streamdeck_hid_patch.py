@@ -1,12 +1,17 @@
 """
-Focused StreamDeck patches for cold first-press.
+Patch StreamDeck beta-resume HID reader so last_key_states always advances,
+and add cold-start diagnostics for silent first physical presses.
 
-1. Resume reader: always advance last_key_states (match `_read()`), even when
-   key_callback is still None during open().
-2. LibUSBHIDAPI: do not hold Library.mutex around hid_read/hid_write — Device
-   mutex already serializes a handle. Global lock during image OUT floods can
-   starve the IN reader; multi-prime without this made cold press *worse*
-   (~0% vs ~50% with a single prime).
+Upstream `_read_with_resume_from_suspend` only updated last_key_states when a
+key_callback was set. During open()/clear() that left sticky True bits, and the
+first physical press was a silent no-op (old==new → no callback).
+
+Sep 20 cold sessions still showed zero `hardware key_event` with no sticky
+bits — HID IN reports never arrived until a GUI press forced a key-image USB
+OUT. This patch also:
+  - instruments None-vs-data reads (heartbeat while stalled)
+  - drops LibUSBHIDAPI Library.mutex around hid_read/hid_write so image OUT
+    floods cannot starve the IN reader (Device.mutex still serializes a handle)
 """
 
 from __future__ import annotations
@@ -75,19 +80,61 @@ def apply_streamdeck_resume_reader_patch() -> bool:
         return False
 
     def _read_with_resume_from_suspend(self) -> None:
+        none_streak = 0
+        data_reports = 0
+        key_reports = 0
+        last_heartbeat = time.monotonic()
+        logged_first_data = False
+
         while self.run_read_thread:
             try:
                 control_states = self._read_control_states()
                 if control_states is None:
+                    none_streak += 1
+                    now = time.monotonic()
+                    # Until the first real key report, emit a heartbeat so cold
+                    # stalls are visible (all-None read path vs sticky state).
+                    if key_reports == 0 and now - last_heartbeat >= 5.0:
+                        log.info(
+                            f"[first-press] HID read heartbeat deck={self.id()} "
+                            f"none_streak={none_streak} data_reports={data_reports} "
+                            f"key_reports={key_reports} "
+                            f"last_key_states_true="
+                            f"{[i for i, v in enumerate(self.last_key_states) if v]}"
+                        )
+                        last_heartbeat = now
                     time.sleep(1.0 / self.read_poll_hz)
                     continue
 
+                none_streak = 0
+                data_reports += 1
+                if not logged_first_data:
+                    logged_first_data = True
+                    log.info(
+                        f"[first-press] HID first non-None report deck={self.id()} "
+                        f"controls={list(control_states.keys())}"
+                    )
+
                 if ControlType.KEY in control_states:
-                    for k, (old, new) in enumerate(
-                        zip(self.last_key_states, control_states[ControlType.KEY])
-                    ):
-                        if old == new:
-                            continue
+                    key_reports += 1
+                    changes = [
+                        (k, old, new)
+                        for k, (old, new) in enumerate(
+                            zip(self.last_key_states, control_states[ControlType.KEY])
+                        )
+                        if old != new
+                    ]
+                    # Concurrent image writes sometimes yield garbage multi-key
+                    # flips; treat as state sync only (no app callbacks).
+                    if len(changes) > 2:
+                        for k, _old, new in changes:
+                            self.last_key_states[k] = new
+                        log.warning(
+                            f"[first-press] ignored noisy HID key report "
+                            f"n_changes={len(changes)} indices={[c[0] for c in changes]}"
+                        )
+                        continue
+                    for k, _old, new in changes:
                         self.last_key_states[k] = new
                         if self.key_callback is not None:
                             self.key_callback(self, k, new)
@@ -137,5 +184,32 @@ def apply_streamdeck_resume_reader_patch() -> bool:
 
     StreamDeck._read_with_resume_from_suspend = _read_with_resume_from_suspend
     _PATCHED = True
-    log.info("[first-press] applied StreamDeck resume-reader state patch")
+    log.info("[first-press] applied StreamDeck resume-reader HID state patch")
     return True
+
+
+def kick_hid_input(deck, reason: str = "") -> bool:
+    """
+    Nudge the USB HID path with a short OUT / feature write.
+
+    Prefer DeckController._kick_hid_input which also force-repaints a key
+    (same traffic as GUI simulate_press). This helper is the low-level half.
+    """
+    try:
+        raw = getattr(deck, "deck", deck)
+        if hasattr(raw, "_reset_key_stream"):
+            raw._reset_key_stream()
+        if hasattr(raw, "set_brightness"):
+            pct = 75
+            try:
+                pct = int(getattr(raw, "_kick_brightness", pct))
+            except Exception:
+                pct = 75
+            raw.set_brightness(pct)
+        if hasattr(raw, "get_serial_number"):
+            _ = raw.get_serial_number()
+        log.info(f"[first-press] HID wake kick reason={reason}")
+        return True
+    except Exception as e:
+        log.warning(f"[first-press] HID wake kick failed reason={reason}: {e}")
+        return False

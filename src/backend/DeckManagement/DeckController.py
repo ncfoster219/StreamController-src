@@ -1009,27 +1009,28 @@ class DeckController:
             f"[first-press] press_ready=True "
             f"flushing={len(pending)} page={getattr(self.active_page, 'json_path', None)}"
         )
-        # Cold HID: force key-image USB OUTs after page ready (same traffic as
-        # GUI simulate_press). A single prime is intermittent (~50% in focused
-        # tests); retries through ~8s cover media-player image flood finishing
-        # and re-arm a wedged IN path without sticky-resync / LibUSB changes.
+        # Drop sticky HID edge state accumulated during open()/clear()/image
+        # load. A stuck True in last_key_states makes the first physical press
+        # a silent no-op (library only fires on old!=new) — matches cold
+        # sc-native sessions with zero hardware key_event lines.
+        self._resync_hid_key_states(reason="press_ready")
+        # Cold sessions still saw zero hardware events with no sticky bits until
+        # a GUI simulate_press forced a key-image USB OUT. Kick the HID path.
+        self._kick_hid_input(reason="press_ready")
+        # Image/media writes after press_ready can corrupt HID edges; re-sync
+        # and re-kick a few times after the media player finishes flooding OUT.
         for delay_ms, label in (
-            (0, "press_ready"),
             (750, "delayed_750ms"),
             (1500, "delayed_1500ms"),
             (3000, "delayed_3000ms"),
             (5000, "delayed_5000ms"),
             (8000, "delayed_8000ms"),
         ):
-            if delay_ms == 0:
-                self._prime_hid_input(reason=label)
-                continue
-
-            def _prime(resync_label=label) -> bool:
-                self._prime_hid_input(reason=resync_label)
+            def _delayed(resync_label=label) -> bool:
+                self._resync_hid_key_states(reason=resync_label)
+                self._kick_hid_input(reason=resync_label)
                 return False
-
-            GLib.timeout_add(delay_ms, _prime)
+            GLib.timeout_add(delay_ms, _delayed)
 
         for ident, args, kwargs in pending:
             # Already on/off main — schedule flush on main to keep order with HID marshal
@@ -1050,9 +1051,45 @@ class DeckController:
         d = self.deck
         return getattr(d, "deck", d)
 
-    def _prime_hid_input(self, reason: str = "") -> None:
-        """Force-repaint one key so HID IN starts delivering (matches GUI path)."""
+    def _resync_hid_key_states(self, reason: str = "") -> None:
+        """
+        Reset cached HID key edges so the next physical press always generates
+        a callback. Safe when no keys are held; if a key is physically held we
+        may miss that hold until release+repress (acceptable for cold start).
+        """
         try:
+            raw = self._raw_streamdeck()
+            states = getattr(raw, "last_key_states", None)
+            if not states:
+                return
+            sticky = [i for i, v in enumerate(states) if v]
+            if sticky:
+                log.warning(
+                    f"[first-press] clearing sticky last_key_states indices={sticky} "
+                    f"reason={reason}"
+                )
+            else:
+                log.info(
+                    f"[first-press] hid key state sync (no sticky bits) "
+                    f"n={len(states)} reason={reason}"
+                )
+            raw.last_key_states = [False] * len(states)
+            dials = getattr(raw, "last_dial_states", None)
+            if dials:
+                raw.last_dial_states = [False] * len(dials)
+        except Exception as e:
+            log.warning(f"[first-press] hid key state sync failed: {e}")
+
+    def _kick_hid_input(self, reason: str = "") -> None:
+        """Wake a stalled Stream Deck HID IN path the same way GUI press does."""
+        try:
+            from src.backend.DeckManagement.streamdeck_hid_patch import kick_hid_input
+            raw = self._raw_streamdeck()
+            pct = self.brightness if self.brightness is not None else 75
+            setattr(raw, "_kick_brightness", int(pct))
+            kick_hid_input(raw, reason=reason)
+            # GUI simulate_press → ControllerKey.update(force=True) → set_key_image.
+            # That image OUT is what correlated with hardware starting to work.
             for group in self.inputs.values():
                 if not group:
                     continue
@@ -1060,12 +1097,12 @@ class DeckController:
                 if hasattr(key, "update"):
                     key.update(force=True)
                     log.info(
-                        f"[first-press] HID prime force-repaint "
+                        f"[first-press] HID wake force-repaint "
                         f"ident={getattr(key, 'identifier', None)} reason={reason}"
                     )
                 break
         except Exception as e:
-            log.warning(f"[first-press] HID prime failed: {e}")
+            log.warning(f"[first-press] HID wake kick wrapper failed: {e}")
 
     def key_event_callback(self, deck, key, *args, **kwargs):
         try:
@@ -1414,6 +1451,8 @@ class DeckController:
             for future in futures:
                 future.result()
         log.info(f"Loading all inputs took {time.time() - start} seconds")
+        # Image writes can leave sticky HID edges after press_ready sync.
+        self._resync_hid_key_states(reason="load_all_inputs")
 
     def load_input_from_identifier(self, identifier: str, page: Page, update: bool = True):
         controller_input = self.get_input(identifier)

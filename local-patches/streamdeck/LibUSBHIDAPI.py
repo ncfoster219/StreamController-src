@@ -358,8 +358,9 @@ class LibUSBHIDAPI(Transport):
             if not handle:
                 raise TransportError("No HID device.")
 
-            # Device.mutex already serializes per-handle I/O. Holding the global
-            # Library.mutex during image OUT floods starves the IN reader.
+            # Do not take Library.mutex here — Device.mutex already serializes
+            # per-handle I/O. Holding the global lock during image OUT floods
+            # starved the non-blocking IN reader (cold first-press stalls).
             result = self.hidapi.hid_write(handle, bytes(data), len(data))
 
             if result < 0:
@@ -384,6 +385,8 @@ class LibUSBHIDAPI(Transport):
 
             data = ctypes.create_string_buffer(length)
 
+            # See write(): per-handle Device.mutex is enough; avoid starving
+            # reads behind long image OUT sequences on Library.mutex.
             result = self.hidapi.hid_read(handle, data, len(data))
 
             if result < 0:
