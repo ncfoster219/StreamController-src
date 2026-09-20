@@ -257,22 +257,11 @@ class StreamDeck(ABC):
                 # True bits in last_key_states during open()/image load, so the
                 # first real press was a no-op (old==new) with no key_callback.
                 if ControlType.KEY in control_states:
-                    changes = [
-                        (k, old, new)
-                        for k, (old, new) in enumerate(
-                            zip(self.last_key_states, control_states[ControlType.KEY])
-                        )
-                        if old != new
-                    ]
-                    if len(changes) > 2:
-                        for k, _old, new in changes:
-                            self.last_key_states[k] = new
-                        logger.warning(
-                            "Ignored noisy HID key report on deck %s n_changes=%d indices=%s",
-                            self.id(), len(changes), [c[0] for c in changes],
-                        )
-                        continue
-                    for k, _old, new in changes:
+                    for k, (old, new) in enumerate(
+                        zip(self.last_key_states, control_states[ControlType.KEY])
+                    ):
+                        if old == new:
+                            continue
                         self.last_key_states[k] = new
                         if self.key_callback is not None:
                             self.key_callback(self, k, new)
