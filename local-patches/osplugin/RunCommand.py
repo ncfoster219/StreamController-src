@@ -259,6 +259,9 @@ class RunCommand(ActionBase):
                     f"via {launch_method}"
                 )
                 command = rewritten
+            else:
+                # Page may already store `gapplication launch …` — still treat as activator.
+                launch_method = detect_activator_method(command)
 
         if is_in_flatpak():
             command = "flatpak-spawn --host " + command
@@ -273,9 +276,7 @@ class RunCommand(ActionBase):
             )
 
         # Do NOT wrap Popen in multiprocessing.Process (fork under GTK/HID threads).
-        activator = launch_method.split(":", 1)[0] in (
-            "gapplication", "gtk-launch", "gio", "systemd-run",
-        )
+        activator = is_activator_method(launch_method) or is_activator_command(command)
         try:
             if detached:
                 err_file = tempfile.NamedTemporaryFile(
@@ -317,6 +318,10 @@ class RunCommand(ActionBase):
                             f"rc={rc} at={label} method={launch_method} "
                             f"cmd={command!r} stderr={err_tail!r}"
                         )
+                        if activator and rc == 0:
+                            # Gtk single-instance often only sets DEMANDS_ATTENTION;
+                            # raise the window so a cold deck press is visible.
+                            raise_launched_gui_window(command, launch_method, env)
                         exited = True
                         break
                 if not exited:
@@ -326,6 +331,8 @@ class RunCommand(ActionBase):
                             f"[first-press] RunCommand stderr pid={proc.pid} "
                             f"cmd={command!r} stderr={err_tail!r}"
                         )
+                    elif activator:
+                        raise_launched_gui_window(command, launch_method, env)
                 return ""
 
             result = subprocess.Popen(
@@ -512,6 +519,81 @@ def find_desktop_entry_for_command(command: str):
     return None, None, False
 
 
+def is_activator_method(launch_method: str) -> bool:
+    return launch_method.split(":", 1)[0] in (
+        "gapplication", "gtk-launch", "gio", "systemd-run",
+    )
+
+
+def is_activator_command(command: str) -> bool:
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        parts = command.split()
+    if not parts:
+        return False
+    return parts[0] in ("gapplication", "gtk-launch", "gio", "systemd-run")
+
+
+def detect_activator_method(command: str) -> str:
+    """Tag already-rewritten activator commands stored on the page."""
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return "raw"
+    if len(parts) >= 3 and parts[0] == "gapplication" and parts[1] == "launch":
+        return f"gapplication:{parts[2]}"
+    if len(parts) >= 2 and parts[0] == "gtk-launch":
+        return f"gtk-launch:{parts[1]}"
+    if len(parts) >= 2 and parts[0] == "gio" and parts[1] == "launch":
+        return f"gio:{parts[2] if len(parts) > 2 else parts[1]}"
+    return "raw"
+
+
+def raise_launched_gui_window(command: str, launch_method: str, env: dict) -> None:
+    """
+    After DBus activation, Gtk often only sets DEMANDS_ATTENTION. On KDE/X11
+    that can leave the window behind StreamController — raise it explicitly.
+    """
+    if not shutil.which("wmctrl"):
+        return
+    hints: list[str] = []
+    method = launch_method or ""
+    if "cpupower" in command.lower() or "cpupower" in method.lower():
+        hints.extend(["cpupower-gui", "cpupower"])
+    if method.startswith("gapplication:"):
+        app_id = method.split(":", 1)[1]
+        hints.append(app_id.split(".")[-1].replace("_", "-"))
+        hints.append(app_id.split(".")[-1])
+    try:
+        parts = shlex.split(command)
+        if len(parts) >= 3 and parts[0] == "gapplication":
+            app_id = parts[2]
+            hints.append(app_id.split(".")[-1].replace("_", "-"))
+    except ValueError:
+        pass
+    # Dedupe preserving order
+    seen = set()
+    ordered = []
+    for h in hints:
+        if h and h not in seen:
+            seen.add(h)
+            ordered.append(h)
+    for hint in ordered:
+        try:
+            r = subprocess.run(
+                ["wmctrl", "-a", hint],
+                env=env,
+                timeout=2,
+                capture_output=True,
+            )
+            if r.returncode == 0:
+                log.info(f"[first-press] RunCommand raised window hint={hint!r}")
+                return
+        except Exception as e:
+            log.debug(f"[first-press] wmctrl -a {hint!r} failed: {e}")
+
+
 def rewrite_command_for_desktop_launch(command: str):
     """
     Rewrite a simple GUI command to a session-aware launcher when possible.
@@ -519,7 +601,7 @@ def rewrite_command_for_desktop_launch(command: str):
     """
     path, app_id, dbus_act = find_desktop_entry_for_command(command)
     if not path:
-        return command, "raw"
+        return command, detect_activator_method(command)
     if dbus_act and app_id and shutil.which("gapplication"):
         return f"gapplication launch {shlex.quote(app_id)}", f"gapplication:{app_id}"
     desk_id = os.path.splitext(os.path.basename(path))[0]
