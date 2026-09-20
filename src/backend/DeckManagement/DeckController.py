@@ -1009,15 +1009,27 @@ class DeckController:
             f"[first-press] press_ready=True "
             f"flushing={len(pending)} page={getattr(self.active_page, 'json_path', None)}"
         )
-        # Cold HID: after page images settle, force one key-image USB OUT
-        # (same traffic as GUI simulate_press). Without this, the first physical
-        # press can produce zero hardware key_event until a GUI click.
-        self._prime_hid_input(reason="press_ready")
-        # Media player may still be writing keys briefly after press_ready.
-        def _prime_after_images() -> bool:
-            self._prime_hid_input(reason="delayed_1500ms")
-            return False
-        GLib.timeout_add(1500, _prime_after_images)
+        # Cold HID: force key-image USB OUTs after page ready (same traffic as
+        # GUI simulate_press). A single prime is intermittent (~50% in focused
+        # tests); retries through ~8s cover media-player image flood finishing
+        # and re-arm a wedged IN path without sticky-resync / LibUSB changes.
+        for delay_ms, label in (
+            (0, "press_ready"),
+            (750, "delayed_750ms"),
+            (1500, "delayed_1500ms"),
+            (3000, "delayed_3000ms"),
+            (5000, "delayed_5000ms"),
+            (8000, "delayed_8000ms"),
+        ):
+            if delay_ms == 0:
+                self._prime_hid_input(reason=label)
+                continue
+
+            def _prime(resync_label=label) -> bool:
+                self._prime_hid_input(reason=resync_label)
+                return False
+
+            GLib.timeout_add(delay_ms, _prime)
 
         for ident, args, kwargs in pending:
             # Already on/off main — schedule flush on main to keep order with HID marshal
