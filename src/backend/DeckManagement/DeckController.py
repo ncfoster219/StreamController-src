@@ -1019,7 +1019,13 @@ class DeckController:
         self._kick_hid_input(reason="press_ready")
         # Image/media writes after press_ready can corrupt HID edges; re-sync
         # and re-kick a few times after the media player finishes flooding OUT.
-        for delay_ms, label in ((750, "delayed_750ms"), (1500, "delayed_1500ms"), (3000, "delayed_3000ms")):
+        for delay_ms, label in (
+            (750, "delayed_750ms"),
+            (1500, "delayed_1500ms"),
+            (3000, "delayed_3000ms"),
+            (5000, "delayed_5000ms"),
+            (8000, "delayed_8000ms"),
+        ):
             def _delayed(resync_label=label) -> bool:
                 self._resync_hid_key_states(reason=resync_label)
                 self._kick_hid_input(reason=resync_label)
@@ -1075,14 +1081,26 @@ class DeckController:
             log.warning(f"[first-press] hid key state sync failed: {e}")
 
     def _kick_hid_input(self, reason: str = "") -> None:
-        """Wake a stalled Stream Deck HID IN path with a short USB OUT/feature."""
+        """Wake a stalled Stream Deck HID IN path the same way GUI press does."""
         try:
             from src.backend.DeckManagement.streamdeck_hid_patch import kick_hid_input
             raw = self._raw_streamdeck()
-            # Prefer the live deck brightness so the kick does not flash dim/bright.
             pct = self.brightness if self.brightness is not None else 75
             setattr(raw, "_kick_brightness", int(pct))
             kick_hid_input(raw, reason=reason)
+            # GUI simulate_press → ControllerKey.update(force=True) → set_key_image.
+            # That image OUT is what correlated with hardware starting to work.
+            for group in self.inputs.values():
+                if not group:
+                    continue
+                key = group[0]
+                if hasattr(key, "update"):
+                    key.update(force=True)
+                    log.info(
+                        f"[first-press] HID wake force-repaint "
+                        f"ident={getattr(key, 'identifier', None)} reason={reason}"
+                    )
+                break
         except Exception as e:
             log.warning(f"[first-press] HID wake kick wrapper failed: {e}")
 

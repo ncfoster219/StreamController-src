@@ -192,9 +192,8 @@ def kick_hid_input(deck, reason: str = "") -> bool:
     """
     Nudge the USB HID path with a short OUT / feature write.
 
-    Cold sessions (2026-09-20) showed zero hardware key_event until a GUI
-    simulate_press forced a key-image write. Mirror that with a cheap wake:
-    reset the image streamer, rewrite brightness, touch serial feature read.
+    Prefer DeckController._kick_hid_input which also force-repaints a key
+    (same traffic as GUI simulate_press). This helper is the low-level half.
     """
     try:
         raw = getattr(deck, "deck", deck)
