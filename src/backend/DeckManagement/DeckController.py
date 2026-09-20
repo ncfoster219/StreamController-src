@@ -1014,10 +1014,15 @@ class DeckController:
         # a silent no-op (library only fires on old!=new) — matches cold
         # sc-native sessions with zero hardware key_event lines.
         self._resync_hid_key_states(reason="press_ready")
-        # Image/media writes after press_ready can corrupt HID edges; re-sync a few times.
+        # Cold sessions still saw zero hardware events with no sticky bits until
+        # a GUI simulate_press forced a key-image USB OUT. Kick the HID path.
+        self._kick_hid_input(reason="press_ready")
+        # Image/media writes after press_ready can corrupt HID edges; re-sync
+        # and re-kick a few times after the media player finishes flooding OUT.
         for delay_ms, label in ((750, "delayed_750ms"), (1500, "delayed_1500ms"), (3000, "delayed_3000ms")):
             def _delayed(resync_label=label) -> bool:
                 self._resync_hid_key_states(reason=resync_label)
+                self._kick_hid_input(reason=resync_label)
                 return False
             GLib.timeout_add(delay_ms, _delayed)
 
@@ -1068,6 +1073,18 @@ class DeckController:
                 raw.last_dial_states = [False] * len(dials)
         except Exception as e:
             log.warning(f"[first-press] hid key state sync failed: {e}")
+
+    def _kick_hid_input(self, reason: str = "") -> None:
+        """Wake a stalled Stream Deck HID IN path with a short USB OUT/feature."""
+        try:
+            from src.backend.DeckManagement.streamdeck_hid_patch import kick_hid_input
+            raw = self._raw_streamdeck()
+            # Prefer the live deck brightness so the kick does not flash dim/bright.
+            pct = self.brightness if self.brightness is not None else 75
+            setattr(raw, "_kick_brightness", int(pct))
+            kick_hid_input(raw, reason=reason)
+        except Exception as e:
+            log.warning(f"[first-press] HID wake kick wrapper failed: {e}")
 
     def key_event_callback(self, deck, key, *args, **kwargs):
         try:
