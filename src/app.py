@@ -149,6 +149,13 @@ class App(Adw.Application):
         if not gl.IS_MAC:
             start_dbus_service()
 
+        # Daemon-only never builds MainWindow, so tray.initialize(main_win) never
+        # runs. Register the StatusNotifier item here so login autostart still
+        # gets a tray icon (StatusNotifierWatcher may appear slightly later;
+        # trayicon.py already watches the bus name and re-registers).
+        if self.daemon_only and gl.tray_icon is not None and not gl.IS_MAC:
+            GLib.idle_add(self._start_daemon_tray)
+
         # Prime WindowGrabber against the already-focused window. Without this,
         # auto-change / page readiness can stay stale until the first focus
         # change (GUI reopen, launching an app from a RunCommand key, etc.) —
@@ -161,6 +168,13 @@ class App(Adw.Application):
             GLib.idle_add(gl.window_grabber.recheck_active_window)
 
         log.success("Finished loading app")
+
+    def _start_daemon_tray(self):
+        try:
+            gl.tray_icon.initialize_for_daemon(self)
+        except Exception as e:
+            log.warning(f"Failed to start tray in daemon-only mode: {e}")
+        return False
 
     def on_reopen(self, *args, **kwargs):
         self.ensure_main_window(present=True)

@@ -30,6 +30,7 @@ class TrayIcon(DBusTrayIcon):
         self.set_tooltip("StreamController")
 
         self.main_win = None
+        self._app = None
         self.show_about_action = None
         self.show_store_action = None
         self.show_settings_action = None
@@ -65,6 +66,38 @@ class TrayIcon(DBusTrayIcon):
             self.register()
 
     @log.catch
+    def initialize_for_daemon(self, app):
+        """
+        Register the StatusNotifier item without creating MainWindow.
+
+        Autostart uses --daemon-only, which skips ensure_main_window(); without
+        this path the tray never appears until the UI is opened interactively.
+        """
+        self._app = app
+        app_settings = gl.settings_manager.get_app_settings()
+        show_now = app_settings.get("ui", {}).get("tray-icon", True)
+        if show_now:
+            self.register()
+            log.info("Tray icon registered in daemon-only mode (no main window yet)")
+
+    def _ensure_window_actions(self, present: bool = False):
+        """Create MainWindow if needed and wire tray menu actions to it."""
+        if self.main_win is not None and self.quit_app_action is not None:
+            if present:
+                self.main_win.present()
+            return self.main_win
+
+        app = self._app or gl.app
+        if app is None:
+            log.error("Cannot open StreamController UI: app not ready")
+            return None
+
+        win = app.ensure_main_window(present=present)
+        # initialize() re-wires actions; register() is a no-op if already registered
+        self.initialize(win)
+        return win
+
+    @log.catch
     def start(self):
         self.register()
 
@@ -74,24 +107,34 @@ class TrayIcon(DBusTrayIcon):
 
     @log.catch
     def on_show(self):
-        self.main_win.present()
+        self._ensure_window_actions(present=True)
 
     @log.catch
     def on_settings(self):
-        self.show_settings_action.activate()
+        self._ensure_window_actions(present=True)
+        if self.show_settings_action is not None:
+            self.show_settings_action.activate()
 
     @log.catch
     def on_store(self):
-        self.show_store_action.activate()
+        self._ensure_window_actions(present=True)
+        if self.show_store_action is not None:
+            self.show_store_action.activate()
 
     @log.catch
     def on_about(self):
-        self.main_win.present()
-        self.show_about_action.activate()
+        self._ensure_window_actions(present=True)
+        if self.show_about_action is not None:
+            self.show_about_action.activate()
 
     @log.catch
     def on_quit(self):
-        self.quit_app_action.activate()
+        if self.quit_app_action is not None:
+            self.quit_app_action.activate()
+            return
+        app = self._app or gl.app
+        if app is not None:
+            app.activate_action("quit", None)
 
     @log.catch
     def on_restart(self):
@@ -123,7 +166,7 @@ exec "$@"
             stderr=subprocess.DEVNULL,
         )
 
-        self.quit_app_action.activate()
+        self.on_quit()
 
 
 

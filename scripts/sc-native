@@ -1,21 +1,25 @@
 #!/usr/bin/env bash
 # One-command native StreamController launcher for Jiggly-Stream-Machine.
-# Usage: sc-native
+# Usage: sc-native [--daemon-only] [-b]
 set -euo pipefail
 
 SC_HOME="${SC_HOME:-$HOME/StreamController}"
 DATA="${SC_DATA:-$HOME/.var/app/com.core447.StreamController/data}"
 VENV="$SC_HOME/.venv-native"
+# Max seconds to wait for StatusNotifierWatcher before starting (daemon-only).
+SNI_WAIT_SECS="${SC_SNI_WAIT_SECS:-30}"
 
 usage() {
   cat <<'EOF'
 sc-native — start native StreamController (patched data path)
 
-  sc-native              start (foreground; Ctrl+C or tray Quit to stop)
-  sc-native --stop       quit running StreamController / flatpak instance
-  sc-native --status     show if something is running
-  sc-native --test-key   with SC already running: emulate the cpupower button
-  sc-native --help       this help
+  sc-native                 start (foreground; Ctrl+C or tray Quit to stop)
+  sc-native --daemon-only   start without main window (for login autostart)
+  sc-native -b              start in background (SC flag)
+  sc-native --stop          quit running StreamController / flatpak instance
+  sc-native --status        show if something is running
+  sc-native --test-key      with SC already running: emulate the cpupower button
+  sc-native --help          this help
 
 You do NOT need git checkout / source activate every time.
 
@@ -28,7 +32,7 @@ EOF
 # only match the first 15 chars of comm, so -x never finds it.
 list_sc_pids() {
   ps -eo pid=,args= | awk '
-    /[Ss]treamController/ && $0 !~ /sc-native|pgrep|awk|cursor-agent|bash -O/ {
+    /[Ss]treamController/ && $0 !~ /sc-native|pgrep|awk|cursor-agent|bash -O|streamcontroller / {
       print $1
     }
   '
@@ -69,7 +73,7 @@ status_sc() {
   local pids
   pids="$(list_sc_pids || true)"
   if [[ -n "${pids//[$'\n' ]/}" ]]; then
-    ps -eo pid,etime,cmd | awk 'NR==1 || /[Ss]treamController/' | grep -vE 'sc-native|awk|cursor-agent|bash -O' || true
+    ps -eo pid,etime,cmd | awk 'NR==1 || /[Ss]treamController/' | grep -vE 'sc-native|awk|cursor-agent|bash -O|streamcontroller ' || true
     return 0
   fi
   echo "Not running."
@@ -95,13 +99,60 @@ test_key() {
   fi
 }
 
+# At login, plasmashell/kded may not own StatusNotifierWatcher yet. SC's tray
+# code watches the name, but waiting briefly avoids a vanished→appear race on
+# some Plasma startups. No-op if already present or gdbus missing.
+wait_for_status_notifier_watcher() {
+  local i=0
+  if ! command -v gdbus >/dev/null 2>&1; then
+    return 0
+  fi
+  if gdbus call --session \
+      --dest org.freedesktop.DBus \
+      --object-path /org/freedesktop/DBus \
+      --method org.freedesktop.DBus.NameHasOwner \
+      org.kde.StatusNotifierWatcher 2>/dev/null | grep -q true; then
+    return 0
+  fi
+  echo "Waiting up to ${SNI_WAIT_SECS}s for StatusNotifierWatcher (tray host)…"
+  while (( i < SNI_WAIT_SECS )); do
+    if gdbus call --session \
+        --dest org.freedesktop.DBus \
+        --object-path /org/freedesktop/DBus \
+        --method org.freedesktop.DBus.NameHasOwner \
+        org.kde.StatusNotifierWatcher 2>/dev/null | grep -q true; then
+      echo "StatusNotifierWatcher is up."
+      return 0
+    fi
+    sleep 1
+    i=$((i + 1))
+  done
+  echo "StatusNotifierWatcher not seen yet — starting anyway (SC will re-register when it appears)."
+}
+
+EXTRA_ARGS=()
+DAEMON_ONLY=0
 case "${1:-}" in
   -h|--help) usage; exit 0 ;;
   --stop) stop_sc; exit $? ;;
   --status) status_sc; exit $? ;;
   --test-key) test_key; exit $? ;;
-  "") ;;
-  *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
+  --daemon-only|-b)
+    [[ "$1" == "--daemon-only" ]] && DAEMON_ONLY=1
+    EXTRA_ARGS+=("$1")
+    shift || true
+    while [[ $# -gt 0 ]]; do
+      EXTRA_ARGS+=("$1")
+      shift
+    done
+    ;;
+  "")
+    ;;
+  *)
+    echo "Unknown option: $1" >&2
+    usage >&2
+    exit 2
+    ;;
 esac
 
 if [[ ! -x "$VENV/bin/python" ]]; then
@@ -118,11 +169,18 @@ if command -v systemctl >/dev/null; then
 fi
 
 cd "$SC_HOME"
-if git -C "$SC_HOME" rev-parse --verify cursor/runcommand-xauth-launch-e5fd >/dev/null 2>&1; then
+# Prefer the confirmed-stable first-press branch (includes daemon-only tray fix).
+if git -C "$SC_HOME" rev-parse --verify cursor/first-press-focused-e5fd >/dev/null 2>&1; then
+  git -C "$SC_HOME" checkout -q cursor/first-press-focused-e5fd 2>/dev/null || true
+elif git -C "$SC_HOME" rev-parse --verify cursor/hid-wake-kick-e5fd >/dev/null 2>&1; then
+  git -C "$SC_HOME" checkout -q cursor/hid-wake-kick-e5fd 2>/dev/null || true
+elif git -C "$SC_HOME" rev-parse --verify cursor/runcommand-xauth-launch-e5fd >/dev/null 2>&1; then
   git -C "$SC_HOME" checkout -q cursor/runcommand-xauth-launch-e5fd 2>/dev/null || true
-elif git -C "$SC_HOME" rev-parse --verify cursor/first-press-glib-marshal-e5fd >/dev/null 2>&1; then
-  git -C "$SC_HOME" checkout -q cursor/first-press-glib-marshal-e5fd 2>/dev/null || true
+fi
+
+if [[ "$DAEMON_ONLY" -eq 1 ]]; then
+  wait_for_status_notifier_watcher
 fi
 
 echo "Starting StreamController (pid will be this process)…"
-exec "$VENV/bin/python" main.py --devel --data "$DATA"
+exec "$VENV/bin/python" main.py --devel --data "$DATA" "${EXTRA_ARGS[@]}"
